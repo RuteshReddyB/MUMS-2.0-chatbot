@@ -1,1 +1,1 @@
-web: gunicorn MUMS_2.0_app:app
+web: gunicorn app:app
