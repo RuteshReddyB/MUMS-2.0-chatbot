@@ -1,0 +1,5 @@
+pandas
+openai
+flask
+flask-cors
+gunicorn
