@@ -3,52 +3,111 @@ import pandas as pd
 from openai import OpenAI
 import os
 
-# NEW: Import Flask and jsonify
+# LangChain imports for Semantic Search
+from langchain.schema import Document
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+
+# Flask imports
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app) # Enable CORS for frontend communication
+CORS(app)  # Enable CORS for frontend communication
 
-# 1. Load your csv file
+# ============================================================
+# 1. Load CSV file using Pandas
+# ============================================================
 try:
     df = pd.read_csv("MUMS 2.0_dataset.csv")
 except FileNotFoundError:
     print("Error: The CSV file was not found. Please check the file path.")
     exit()
 
+# ============================================================
 # 2. Connect to OpenAI
+# ============================================================
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     raise ValueError("OPENAI_API_KEY environment variable not set.")
 client = OpenAI(api_key=api_key)
 
-# ==== Search students (simple word match) ====
-def search_students(query):
-    query_lower = query.lower()
-    mask = df.apply(
-        lambda row: query_lower in str(row).lower(),
-        axis=1
+# ============================================================
+# 3. Convert each CSV row into a LangChain Document
+#    Each row becomes one Document with:
+#      - page_content : readable string of all columns
+#      - metadata     : original row as a dict (for reference)
+# ============================================================
+documents = []
+for _, row in df.iterrows():
+    # Build a readable sentence from every column in the row
+    content = " | ".join([f"{col}: {val}" for col, val in row.items()])
+    documents.append(
+        Document(
+            page_content=content,
+            metadata=row.to_dict()
+        )
     )
-    return df[mask]
+
+# ============================================================
+# 4. Create OpenAI Embeddings and build the FAISS Vector Store
+#    This runs ONCE at startup and stays in memory.
+#    - text-embedding-3-small converts text → 1536-dim vector
+#    - FAISS indexes those vectors for fast similarity search
+# ============================================================
+print("Building semantic vector index... (runs once at startup)")
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small",
+    api_key=api_key
+)
+vector_store = FAISS.from_documents(documents, embeddings)
+
+# ============================================================
+# 5. Create a Retriever — fetches top-5 semantically closest docs
+# ============================================================
+retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+print("Vector index ready. App is running.")
+
+
+# ==== Semantic Search using LangChain Retriever ====
+def search_students(query):
+    """
+    Uses FAISS vector similarity to find the 5 most semantically
+    relevant student records for the given query.
+    Unlike keyword search, this understands meaning — so
+    'computer science students' matches 'CSE' branch records.
+    """
+    results = retriever.invoke(query)
+    return results
+
 
 # ==== Main chatbot logic ====
 def get_bot_response(user_message):
-    matches = search_students(user_message)
+    # Step 1: Semantic retrieval — find relevant student records
+    matched_docs = search_students(user_message)
 
-    context = matches.to_string(index=False)
-    
-    prompt_template = f"""You are a helpful assistant for IIIT Bhubaneswar that answers questions by referring to the provided participant data table.
-students Data Table:
+    # Step 2: Combine retrieved documents into a single context string
+    if matched_docs:
+        context = "\n".join([doc.page_content for doc in matched_docs])
+    else:
+        context = "No relevant student records were found."
+
+    # Step 3: Build the prompt — inject retrieved context into the system role
+    prompt_template = f"""You are a helpful assistant for IIIT Bhubaneswar that answers questions by referring to the provided student data.
+
+Student Data (retrieved by semantic search):
 {context}
 
-Based on the table, answer the following question. If a student's ID, name, or branch is mentioned, always include their ID, name, and branch in your response. If no matching information is found, state that no matching students were found.
+Based on the data above, answer the following question. 
+If a student's ID, name, or branch is mentioned, always include their ID, name, and branch in your response.
+If no matching information is found in the context, state that no matching students were found.
 
 Question: {user_message}
 Answer:
 """
 
+    # Step 4: Call OpenAI GPT to generate the final natural language answer
     try:
         response = client.chat.completions.create(
             model="gpt-4.1-nano-2025-04-14",
@@ -58,14 +117,16 @@ Answer:
             ],
             temperature=0.7
         )
-
         bot_reply = response.choices[0].message.content.strip()
     except Exception as e:
         bot_reply = f"Error: An error occurred with the AI model. Please try again later. Details: {str(e)}"
 
     return bot_reply
 
-# The HTML and CSS for the frontend are stored in a Python string
+
+# ============================================================
+# HTML/CSS/JS Frontend stored in a Python string
+# ============================================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -296,24 +357,26 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# ==== New Flask Endpoint to serve the frontend ====
+# ==== Flask Endpoint to serve the frontend ====
 @app.route('/')
 def home():
     """Renders the HTML template for the chatbot interface."""
     return render_template_string(HTML_TEMPLATE)
 
-# ==== New Flask Endpoint to process chat messages ====
+
+# ==== Flask Endpoint to process chat messages ====
 @app.route('/chat', methods=['POST'])
 def chat():
     """Handles incoming messages and provides a response."""
     data = request.json
     user_message = data.get('message', '')
-    
+
     if not user_message:
         return jsonify({"response": "Please provide a message."}), 400
-        
+
     bot_response = get_bot_response(user_message)
     return jsonify({"response": bot_response})
+
 
 # ==== Run the app ====
 if __name__ == "__main__":
