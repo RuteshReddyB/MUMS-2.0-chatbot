@@ -4,7 +4,7 @@ from openai import OpenAI
 import os
 
 # LangChain imports for Semantic Search
-from langchain.schema import Document
+from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 
